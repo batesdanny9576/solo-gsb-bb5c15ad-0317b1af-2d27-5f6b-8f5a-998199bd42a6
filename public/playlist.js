@@ -83,6 +83,46 @@ const CuePlaylist = (() => {
     });
   }
 
+  // -------------------------------------------------------------------------
+  // 事务原语：在「同一个 readwrite 事务」内读取当前单例文档、同步修改并提交。
+  //
+  // 为什么不能先 readonly get 再开独立 readwrite put（多标签页丢项根因）：
+  //   两个标签页各自先取到同一份旧清单，再分别 put，后提交者整体覆盖先提交者，
+  //   于是另一页勾选 / 移除 / 拖拽的结果丢失。readwrite 事务在同一对象仓库上
+  //   按发起顺序串行执行，事务内的 get 一定读到此前已提交的最新清单；
+  //   mutator 必须为纯同步函数（不得 await，否则事务会在等待期间自动提交），
+  //   返回新的 entries 数组（或就地修改后返回 void）。
+  // 解析值为「实际提交的清单」，页面据此渲染，不再回头另开事务重取。
+  // -------------------------------------------------------------------------
+  function commit(mutator) {
+    return openDB().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      const getReq = store.get(DOC_ID);
+      getReq.onsuccess = () => {
+        const current = normalizeDoc(getReq.result);
+        let nextEntries;
+        try {
+          // mutator 必须同步执行：所有读写请求都在本回调内发起，事务才保持活跃
+          nextEntries = mutator(current) || current.entries;
+        } catch (err) {
+          reject(err);
+          tx.abort();
+          return;
+        }
+        const clean = normalizeDoc({ ...current, entries: nextEntries });
+        clean.updatedAt = new Date().toISOString();
+        store.put(clean);
+        tx.oncomplete = () => resolve(clean);
+      };
+      getReq.onerror = () => reject(getReq.error);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('写入被中止'));
+    }));
+  }
+
+  // 整本文档覆盖写入（显式替换，单事务原子 put；仅在确实要整体替换时使用。
+  // 增删 / 排序一律走 commit 的读-改-写，避免基于外部旧快照覆盖并发修改）
   async function save(doc) {
     const db = await openDB();
     const clean = normalizeDoc(doc);
@@ -96,26 +136,29 @@ const CuePlaylist = (() => {
     });
   }
 
+  // 清空（单事务删除单例文档）；删除后库内有效状态即空文档
   async function clear() {
     const db = await openDB();
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
       tx.objectStore(STORE).delete(DOC_ID);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('写入被中止'));
     });
+    return emptyDoc();
   }
 
-  // 便捷操作：读-改-写整本文档（mutator 返回新 entries 或 void）
+  // 便捷操作：在同一读写事务内读-改-写整本文档（mutator 返回新 entries 或 void）
   async function mutate(fn) {
-    const doc = await get();
-    const next = fn(doc) || doc.entries;
-    return save({ ...doc, entries: next });
+    return commit(fn);
   }
 
-  // 追加批注 id 到清单末尾（已存在则保持原位置不重复加入）
+  // 追加批注 id 到清单末尾（已存在则保持原位置不重复加入）。
+  // 去重以「提交事务内读到的当前清单」为准：并发加入不同批注两项都保留，
+  // 同一批注重复加入仍只出现一次。
   async function addIds(ids) {
-    return mutate((doc) => {
+    return commit((doc) => {
       const have = new Set(doc.entries.map((e) => e.id));
       for (const id of ids) {
         const sid = String(id);
@@ -125,13 +168,17 @@ const CuePlaylist = (() => {
     });
   }
 
+  // 移除一条批注：过滤以提交时的当前清单为准（另一页刚加入的条目不受影响）
   async function removeId(id) {
-    return mutate((doc) => doc.entries.filter((e) => e.id !== String(id)));
+    return commit((doc) => doc.entries.filter((e) => e.id !== String(id)));
   }
 
-  // 直接写入拖拽后的完整 id 顺序（只允许当前清单内 id 的重排，不偷偷新增）
+  // 拖拽排序：只重排「提交事务时仍在清单中」的条目。
+  // orderedIds 中已被移除（或从未存在）的 id 一律忽略；并发期间新增、
+  // 未出现在 orderedIds 中的条目防御性追加到末尾，绝不因排序被丢掉；
+  // 不借排序偷偷新增任何条目。
   async function reorder(orderedIds) {
-    return mutate((doc) => {
+    return commit((doc) => {
       const byId = new Map(doc.entries.map((e) => [e.id, e]));
       const seen = new Set();
       const next = [];
@@ -139,7 +186,8 @@ const CuePlaylist = (() => {
         const sid = String(id);
         if (byId.has(sid) && !seen.has(sid)) { next.push(byId.get(sid)); seen.add(sid); }
       }
-      // 未出现在 orderedIds 中的条目追加到末尾（防御性，正常拖拽不会触发）
+      // 未出现在 orderedIds 中但提交时仍在清单里的条目（如另一标签页刚加入）
+      // 追加到末尾（防御性，正常拖拽不会触发），排序只重排、绝不删项
       for (const e of doc.entries) if (!seen.has(e.id)) next.push(e);
       return next;
     });
@@ -318,6 +366,7 @@ const CuePlaylist = (() => {
     get,
     save,
     clear,
+    commit,
     mutate,
     addIds,
     removeId,

@@ -12,5 +12,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5"
   }
 }

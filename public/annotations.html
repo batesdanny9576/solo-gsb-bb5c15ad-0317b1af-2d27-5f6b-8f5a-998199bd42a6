@@ -630,13 +630,15 @@
 
     async function togglePlEntry(id, on) {
       try {
-        if (on) await CuePlaylist.addIds([id]);
-        else await CuePlaylist.removeId(id);
-        playlist = await CuePlaylist.get();
+        // 增 / 删均在单一读写事务内基于提交时的当前清单完成；直接用实际提交
+        // 回来的清单渲染（含另一标签页的并发增删），不再另开事务重取
+        playlist = on ? await CuePlaylist.addIds([id]) : await CuePlaylist.removeId(id);
         renderPlaylistCard();
         plFlash(on ? '已加入播放清单' : '已从播放清单移除', 'ok');
       } catch {
         plFlash('清单写入失败（IndexedDB 不可用）', 'err');
+        // 写入未提交：复选框回退为库内实际状态，避免页面显示与已提交清单不一致
+        await refreshPlaylist();
       }
     }
 
@@ -658,8 +660,14 @@
       const j = i + delta;
       if (i < 0 || j < 0 || j >= ids.length) return;
       [ids[i], ids[j]] = [ids[j], ids[i]];
-      playlist = await CuePlaylist.reorder(ids);
-      renderPlaylistCard();
+      try {
+        // 排序在单一读写事务内基于提交时仍在清单中的条目重排
+        playlist = await CuePlaylist.reorder(ids);
+        renderPlaylistCard();
+      } catch {
+        plFlash('清单写入失败（IndexedDB 不可用）', 'err');
+        await refreshPlaylist();
+      }
     }
     plItems.addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-pl-rm],[data-pl-up],[data-pl-down]');
@@ -724,8 +732,8 @@
       if (!playlist.entries.length) return;
       if (!confirm(`确定清空播放清单（${playlist.entries.length} 段）？批注本身不会被删除。`)) return;
       try {
-        await CuePlaylist.clear();
-        playlist = await CuePlaylist.get();
+        // clear 单事务删除；返回值即清空后的实际清单（空文档），直接渲染
+        playlist = await CuePlaylist.clear();
         renderPlaylistCard();
         plFlash('清单已清空', 'ok');
       } catch {

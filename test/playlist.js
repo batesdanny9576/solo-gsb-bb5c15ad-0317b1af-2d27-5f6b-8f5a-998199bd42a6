@@ -5,7 +5,9 @@
  *   三、resolvePlaylist 装配器：模拟只读 GET 缓存（含跨场次、日志缺失）
  *   四、虚拟时间轴纯函数：累计偏移、1×/2×/4× 无关的线性映射、
  *       恰好落在边界进入后一段、零长段显式定位、拖动 clamp、跨段映射原场次时刻
- *   五、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
+ *   五、清单读写事务：加入 / 移除 / 排序在同一 IndexedDB 读写事务内
+ *       读当前清单并提交，两个标签页（两条连接）并发增删排序不丢项、不重复
+ *   六、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
  *
  * 运行前提：服务已在 localhost:3000 启动（npm start）。
  */
@@ -15,6 +17,12 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
+
+// 第五部分需要在 Node 内提供 IndexedDB：fake-indexeddb 仅为开发期 devDependency
+// （生产镜像 npm ci --omit=dev 不含），清单本体在浏览器中仍只存浏览器本地库
+const fakeIDB = require('fake-indexeddb');
+global.indexedDB = fakeIDB.indexedDB;
+global.IDBKeyRange = fakeIDB.IDBKeyRange;
 
 let passed = 0, failed = 0;
 function check(name, cond) {
@@ -205,7 +213,89 @@ async function main() {
   const n = P.nudge(cross, 4500, 1000);
   check('nudge 超出末端 clamp', n.vt === 5000 && n.releaseForce === true);
 
-  console.log('五、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
+  console.log('五、清单读写事务：同一读写事务读当前清单并提交，多标签页并发不丢项');
+  // 两条独立的模块实例（各自开关自己的 IndexedDB 连接），等价于两个标签页
+  const P2 = loadBrowserModule('playlist.js', 'CuePlaylist');
+  await new Promise((resolve) => {
+    const q = indexedDB.deleteDatabase(P.DB_NAME);
+    q.onsuccess = resolve; q.onerror = resolve; q.onblocked = resolve;
+  });
+  const idsOf = (doc) => doc.entries.map((e) => e.id);
+
+  let empty = await P.get();
+  check('空库读取得到单例空文档', empty.id === 'main' && Array.isArray(empty.entries) && empty.entries.length === 0);
+
+  // 基础往返
+  const d0 = await P.addIds(['ann-a', 'ann-b']);
+  check('addIds 返回实际提交的清单（含 addedAt）',
+    idsOf(d0).join(',') === 'ann-a,ann-b' && d0.entries.every((e) => typeof e.addedAt === 'string'));
+  const d0b = await P.get();
+  check('重新读取与提交一致', idsOf(d0b).join(',') === 'ann-a,ann-b');
+
+  // 核心：两页并发勾选不同批注，必须在同一读写事务内读到对方已提交的清单
+  const [c1, c2] = await Promise.all([P.addIds(['ann-c']), P2.addIds(['ann-d'])]);
+  check('并发加入各自提交结果含本人新增 id', idsOf(c1).includes('ann-c') && idsOf(c2).includes('ann-d'));
+  const afterConcurrentAdd = idsOf(await P.get());
+  check('并发加入不同批注后两项都保留（不丢项）',
+    afterConcurrentAdd.includes('ann-c') && afterConcurrentAdd.includes('ann-d') && afterConcurrentAdd.length === 4);
+
+  // 重复加入仍只出现一次（同页幂等 + 两页并发加入同一条）
+  const dup = await P.addIds(['ann-a', 'ann-a', 'ann-c', 'ann-d']);
+  check('同页重复加入去重，保持原顺序', idsOf(dup).join(',') === 'ann-a,ann-b,ann-c,ann-d');
+  await Promise.all([P.addIds(['ann-e']), P2.addIds(['ann-e'])]);
+  const afterDup = idsOf(await P.get());
+  check('两页并发加入同一批注，最终仍只出现一次',
+    afterDup.filter((x) => x === 'ann-e').length === 1 && afterDup.length === 5);
+
+  // 并发移除与加入互不覆盖
+  await Promise.all([P.removeId('ann-a'), P2.addIds(['ann-f'])]);
+  const afterRmAdd = new Set(idsOf(await P.get()));
+  check('并发移除 + 加入：被移除项消失、新增项保留，其余不动',
+    !afterRmAdd.has('ann-a') && afterRmAdd.has('ann-f') && afterRmAdd.has('ann-b') && afterRmAdd.size === 5);
+
+  // mutate：同一事务读-改-写，返回实际提交清单
+  const mutated = await P.mutate((doc) => doc.entries.filter((e) => e.id !== 'ann-b'));
+  check('mutate 在事务内基于最新清单修改并返回提交结果',
+    !idsOf(mutated).includes('ann-b') && idsOf(await P.get()).join(',') === idsOf(mutated).join(','));
+
+  // 排序：仅重排提交时仍在清单中的条目；幽灵 id 忽略，不偷偷新增，也不丢项
+  const beforeReorderDoc = await P.get();
+  const addedAtBefore = new Map(beforeReorderDoc.entries.map((e) => [e.id, e.addedAt]));
+  const reordered = await P.reorder(['ghost-x', 'ann-f', 'ann-d', 'ann-c', 'ann-e']);
+  check('排序忽略已不存在的 id，不新增条目',
+    idsOf(reordered).join(',') === 'ann-f,ann-d,ann-c,ann-e');
+  check('排序只动顺序：各条目 addedAt 原样保留（不重建条目）',
+    reordered.entries.every((e) => addedAtBefore.get(e.id) === e.addedAt));
+
+  // 并发排序 + 另一页加入：新条目不丢（防御性追加到末尾），原有条目按提交清单重排
+  await Promise.all([P.reorder(['ann-e', 'ann-c', 'ann-d', 'ann-f']), P2.addIds(['ann-g'])]);
+  const afterReorderAdd = idsOf(await P.get());
+  check('并发排序期间另一页加入的新条目不丢',
+    afterReorderAdd.includes('ann-g') &&
+    afterReorderAdd.filter((x) => x !== 'ann-g').join(',') === 'ann-e,ann-c,ann-d,ann-f');
+
+  // 并发排序 + 另一页移除：排序只重排提交时仍在清单中的条目
+  await Promise.all([P.reorder(['ann-c', 'ann-g', 'ann-d', 'ann-e', 'ann-f']), P2.removeId('ann-d')]);
+  const afterReorderRm = idsOf(await P.get());
+  check('并发排序引用的条目被另一页移除：最终不含被移除项，其余保留',
+    !afterReorderRm.includes('ann-d') &&
+    new Set(afterReorderRm).size === afterReorderRm.length &&
+    ['ann-c', 'ann-e', 'ann-f', 'ann-g'].every((x) => afterReorderRm.includes(x)));
+
+  // mutator 抛错：事务中止，清单保持不变
+  const beforeThrow = idsOf(await P.get()).join(',');
+  let threw = false;
+  try {
+    await P.commit(() => { throw new Error('boom'); });
+  } catch { threw = true; }
+  check('mutator 抛错时事务中止并向上报错', threw);
+  check('抛错未产生部分写入，清单保持不变', idsOf(await P.get()).join(',') === beforeThrow);
+
+  // 清空：单事务删除并返回空文档
+  const cleared = await P.clear();
+  check('clear 后为空文档且库内确为空', cleared.entries.length === 0 && (await P2.get()).entries.length === 0);
+
+  console.log('六、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
   const pageResp = await getPage('/playlist.html');
   const page = pageResp.body;
   check('播放页可访问', pageResp.status === 200);
