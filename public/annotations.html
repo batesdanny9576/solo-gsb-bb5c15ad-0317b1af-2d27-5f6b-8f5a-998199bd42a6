@@ -630,9 +630,11 @@
 
     async function togglePlEntry(id, on) {
       try {
-        if (on) await CuePlaylist.addIds([id]);
-        else await CuePlaylist.removeId(id);
-        playlist = await CuePlaylist.get();
+        // 操作在单个 IndexedDB 读写事务内读当前清单并提交；解析值即
+        // 实际提交的清单（并发标签页的增删也在其中），直接拿它渲染
+        playlist = on
+          ? await CuePlaylist.addIds([id])
+          : await CuePlaylist.removeId(id);
         renderPlaylistCard();
         plFlash(on ? '已加入播放清单' : '已从播放清单移除', 'ok');
       } catch {
@@ -724,8 +726,7 @@
       if (!playlist.entries.length) return;
       if (!confirm(`确定清空播放清单（${playlist.entries.length} 段）？批注本身不会被删除。`)) return;
       try {
-        await CuePlaylist.clear();
-        playlist = await CuePlaylist.get();
+        playlist = await CuePlaylist.clear();
         renderPlaylistCard();
         plFlash('清单已清空', 'ok');
       } catch {

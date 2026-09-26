@@ -5,7 +5,10 @@
  *   三、resolvePlaylist 装配器：模拟只读 GET 缓存（含跨场次、日志缺失）
  *   四、虚拟时间轴纯函数：累计偏移、1×/2×/4× 无关的线性映射、
  *       恰好落在边界进入后一段、零长段显式定位、拖动 clamp、跨段映射原场次时刻
- *   五、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
+ *   五、并发安全：加入 / 移除 / 排序在同一 IndexedDB 读写事务内读-改-写
+ *       （串行化 fake IndexedDB 模拟多标签页：并发加入不丢项、重复加入去重、
+ *       排序只重排提交时仍在清单中的条目、操作返回实际提交的清单）
+ *   六、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）
  *
  * 运行前提：服务已在 localhost:3000 启动（npm start）。
  */
@@ -205,7 +208,197 @@ async function main() {
   const n = P.nudge(cross, 4500, 1000);
   check('nudge 超出末端 clamp', n.vt === 5000 && n.releaseForce === true);
 
-  console.log('五、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
+  console.log('五、并发安全：读-改-写在同一个 IndexedDB 读写事务内（多标签页不丢项）');
+  // 最小 IndexedDB 模拟：readwrite 事务按创建顺序严格串行（前一个 readwrite
+  // 事务提交释放锁后，后一个事务的请求才派发）；所有请求经 setTimeout 异步
+  // 完成。旧实现（readonly 读出 → 独立 readwrite 写入）在该模拟下并发增删
+  // 会丢项；新实现（同一 readwrite 事务内 get→put）串行化后不丢项。
+  function makeFakeIDB() {
+    const storage = new Map();
+    let rwTail = Promise.resolve(); // readwrite 事务 FIFO 队列的队尾
+
+    function makeRequest(exec) {
+      const req = {};
+      setTimeout(() => exec(req), 0);
+      return req;
+    }
+
+    function makeTx(mode) {
+      const tx = { mode, pending: 0, closed: false, oncomplete: null, onerror: null, onabort: null };
+      const previous = rwTail; // 本事务请求需等待前一个 readwrite 事务完成
+      let releaseLock = () => {};
+      if (mode === 'readwrite') {
+        rwTail = previous.then(() => new Promise((release) => { releaseLock = release; }));
+      }
+      const finish = () => {
+        if (tx.closed) return;
+        tx.closed = true;
+        releaseLock();
+        if (tx.oncomplete) tx.oncomplete();
+      };
+      const oneDone = () => {
+        tx.pending--;
+        if (tx.pending === 0) setTimeout(finish, 0);
+      };
+      tx.abort = () => {
+        if (tx.closed) return;
+        // 真实 IndexedDB 的 abort 事件在后续任务中派发（不会在 abort() 内同步触发），
+        // 因此 mutator 抛出的原始错误先于 tx.onabort 的拒绝生效
+        setTimeout(() => {
+          tx.closed = true;
+          releaseLock();
+          if (tx.onabort) tx.onabort();
+        }, 0);
+      };
+      tx.objectStore = () => ({
+        get(key) {
+          tx.pending++;
+          return makeRequest((req) => {
+            previous.then(() => {
+              req.result = storage.has(key) ? JSON.parse(JSON.stringify(storage.get(key))) : undefined;
+              if (req.onsuccess) req.onsuccess();
+              oneDone();
+            });
+          });
+        },
+        put(doc) {
+          tx.pending++;
+          return makeRequest((req) => {
+            previous.then(() => {
+              storage.set(doc.id, JSON.parse(JSON.stringify(doc)));
+              if (req.onsuccess) req.onsuccess();
+              oneDone();
+            });
+          });
+        },
+        delete(key) {
+          tx.pending++;
+          return makeRequest((req) => {
+            previous.then(() => {
+              storage.delete(key);
+              if (req.onsuccess) req.onsuccess();
+              oneDone();
+            });
+          });
+        },
+      });
+      return tx;
+    }
+
+    return {
+      open() {
+        const req = {};
+        setTimeout(() => {
+          req.result = {
+            objectStoreNames: { contains: () => true },
+            createObjectStore: () => {},
+            transaction: (_store, mode) => makeTx(mode),
+          };
+          if (req.onsuccess) req.onsuccess();
+        }, 0);
+        return req;
+      },
+      _storage: storage,
+    };
+  }
+
+  globalThis.indexedDB = makeFakeIDB();
+  const idsOf = (doc) => doc.entries.map((e) => e.id);
+  try {
+    // 场景 1：两个标签页几乎同时勾选两条不同批注（旧实现必丢一项）
+    const [docA, docB] = await Promise.all([P.addIds(['ann-a']), P.addIds(['ann-b'])]);
+    let finalDoc = await P.get();
+    check('并发加入不同批注：两项都保留（不互相覆盖）', idsOf(finalDoc).join(',') === 'ann-a,ann-b');
+    check('并发加入：各操作返回的就是当时实际提交的清单（a 先、b 后）',
+      idsOf(docA).join(',') === 'ann-a' && idsOf(docB).join(',') === 'ann-a,ann-b');
+
+    // 场景 2：并发重复加入同一批注只出现一次
+    const before = idsOf(await P.get());
+    const [again1, again2] = await Promise.all([P.addIds(['ann-a']), P.addIds(['ann-a'])]);
+    finalDoc = await P.get();
+    check('并发重复加入同一批注仍只出现一次', idsOf(finalDoc).join(',') === before.join(','));
+    check('重复加入返回的清单不产生重复条目',
+      idsOf(again1).length === new Set(idsOf(again1)).size &&
+      idsOf(again2).length === new Set(idsOf(again2)).size);
+
+    // 场景 3：三路并发加入不同批注全部保留（事务按 FIFO 定序）
+    await P.clear();
+    await Promise.all([P.addIds(['p']), P.addIds(['q']), P.addIds(['r'])]);
+    finalDoc = await P.get();
+    check('三路并发加入不同批注：三项全部保留', idsOf(finalDoc).join(',') === 'p,q,r');
+
+    // 场景 4：一页拖拽排序与另一页移除并发——排序只重排提交时仍在清单中的条目。
+    // 移除先入队先提交（事务 FIFO），排序事务随后读到 [x,z]：orderedIds
+    // 中的 y 不会把已移除条目加回，其余仅重排为 [z,x]。
+    await P.clear();
+    let seeded = await P.addIds(['x', 'y', 'z']); // 顺序 x,y,z
+    check('预置三条清单成功', idsOf(seeded).join(',') === 'x,y,z');
+    const [removed, reordered] = await Promise.all([P.removeId('y'), P.reorder(['z', 'y', 'x'])]);
+    finalDoc = await P.get();
+    check('并发排序 + 移除：被移除条目不在结果中，其余条目仅被重排（z,x）',
+      idsOf(finalDoc).join(',') === 'z,x');
+    check('排序提交值不含已被他页移除的条目（提交时读到的清单才是重排依据）',
+      idsOf(reordered).join(',') === 'z,x' && idsOf(removed).join(',') === 'x,z');
+
+    // 场景 4b：排序提交前 y 已被他页移除：orderedIds 中的 y 不会被偷偷加回
+    await P.clear();
+    await P.addIds(['x', 'y', 'z']);
+    await P.removeId('y');
+    const reorderedStale = await P.reorder(['z', 'y', 'x']);
+    check('排序提交时某条已不在清单：该 id 不会被排序加回（缺失 id 被忽略）',
+      idsOf(reorderedStale).join(',') === 'z,x');
+
+    // 场景 4c：排序期间他页并发加入新条目，不被排序覆盖丢失（防御性追加末尾）
+    await P.clear();
+    await P.addIds(['x', 'y']);
+    await Promise.all([P.reorder(['y', 'x']), P.addIds(['w'])]);
+    finalDoc = await P.get();
+    check('排序与并发加入同时发生：原条目按新顺序、新加入条目保留',
+      idsOf(finalDoc).join(',') === 'y,x,w');
+
+    // 场景 5：mutator 抛错 → 事务中止，旧清单原样保留，Promise 拒绝
+    const prior = await P.get();
+    let threw = false;
+    try {
+      await P.mutate(() => { throw new Error('boom'); });
+    } catch (e) { threw = e.message === 'boom'; }
+    finalDoc = await P.get();
+    check('mutator 抛错时事务中止且清单不变',
+      threw && idsOf(finalDoc).join(',') === idsOf(prior).join(','));
+
+    // 场景 6：并发清空与加入串行化落地，文档结构始终合法
+    await P.clear();
+    await P.addIds(['x', 'y']);
+    await Promise.all([P.clear(), P.addIds(['k']), P.clear()]);
+    finalDoc = await P.get();
+    check('并发清空 / 加入后文档结构合法（id 唯一、无脏条目）',
+      idsOf(finalDoc).length === new Set(idsOf(finalDoc)).size &&
+      idsOf(finalDoc).every((v) => typeof v === 'string'));
+    const clearedDoc = await P.clear();
+    check('clear 返回提交后的空清单',
+      !!(clearedDoc && Array.isArray(clearedDoc.entries)) && clearedDoc.entries.length === 0);
+
+    // 源码契约：变更必须与读取处在同一个 readwrite 事务（不能拆成 readonly + 独立写入）
+    const plSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'playlist.js'), 'utf8');
+    check('mutate 在单个 readwrite 事务内 get 后再 put（不再先独立 readonly 读）',
+      /db\.transaction\(STORE, 'readwrite'\)[\s\S]{0,160}store\.get\(DOC_ID\)/.test(plSrc) &&
+      !/async function mutate[\s\S]*?await get\(\)/.test(plSrc));
+    // 页面契约：操作完成后直接用事务提交值渲染，不再 get() 重读
+    const annSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'annotations.html'), 'utf8');
+    const toggleBlock = annSrc.slice(annSrc.indexOf('async function togglePlEntry'), annSrc.indexOf('// 候选区复选框'));
+    check('批注簿勾选 / 移除后用操作返回的已提交清单渲染（不再单独 get）',
+      /await CuePlaylist\.addIds\(\[id\]\)/.test(toggleBlock) &&
+      /await CuePlaylist\.removeId\(id\)/.test(toggleBlock) &&
+      !/CuePlaylist\.get\(\)/.test(toggleBlock));
+    const clearIdx = annSrc.indexOf('plClearBtn.addEventListener');
+    const clearBlock = annSrc.slice(clearIdx, clearIdx + 500);
+    check('批注簿清空后用 clear 返回的已提交清单渲染',
+      /playlist = await CuePlaylist\.clear\(\)/.test(clearBlock));
+  } finally {
+    delete globalThis.indexedDB;
+  }
+
+  console.log('六、页面只读性（HTTP GET 静态页，无 WebSocket、无写接口）');
   const pageResp = await getPage('/playlist.html');
   const page = pageResp.body;
   check('播放页可访问', pageResp.status === 200);

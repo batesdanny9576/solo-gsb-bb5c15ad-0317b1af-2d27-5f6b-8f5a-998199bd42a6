@@ -6,7 +6,12 @@
  *     本文件不创建 WebSocket、不调用任何写接口；场次数据仅经复盘只读 GET
  *     接口拉取；
  *   - 清单项仅引用批注 id（外加加入时的文本快照，便于批注被删后仍可辨认），
- *     批注本体仍全部留在 cue-annotations 库中。
+ *     批注本体仍全部留在 cue-annotations 库中；
+ *   - 加入 / 移除 / 拖拽排序都在「同一个 IndexedDB readwrite 事务」内
+ *     读当前清单 → 改数组 → put 提交。同一 object store 上的读写事务按序
+ *     串行执行，因此多个标签页同时勾选不同批注不会互相覆盖：后一个事务
+ *     读到的必是前一个事务提交后的清单；重复加入仍去重，排序只重排提交
+ *     时仍在清单中的条目；操作 Promise 的解析值即实际提交的清单文档。
  *
  * 虚拟时间轴：清单条目经播放前重定位后得到若干「播放段」（按清单顺序，可
  * 跨场次、可重叠——重叠区间按顺序分别播放，绝不合并）。每段贡献
@@ -83,37 +88,56 @@ const CuePlaylist = (() => {
     });
   }
 
-  async function save(doc) {
+  // -------------------------------------------------------------------------
+  // 读-改-写（加入 / 移除 / 排序共用）：get → mutator → put 全部发生在
+  // 同一个 readwrite 事务内。IndexedDB 对同一 object store 的读写事务严格
+  // 串行（含跨标签页 / 跨数据库连接），后一个事务里的 get 必能读到前一个
+  // 事务已 put 的结果，因此并发编辑不再「各自拿旧列表覆盖」。事务提交后
+  // 解析出的 clean 即实际落库的清单文档，页面直接拿它渲染。
+  // -------------------------------------------------------------------------
+  async function mutate(fn) {
     const db = await openDB();
-    const clean = normalizeDoc(doc);
-    clean.updatedAt = new Date().toISOString();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
-      tx.objectStore(STORE).put(clean);
-      tx.oncomplete = () => resolve(clean);
+      const store = tx.objectStore(STORE);
+      const getReq = store.get(DOC_ID);
+      // 成功回调内同步发起 put：事务在本回调返回前不会自动提交
+      getReq.onsuccess = () => {
+        let committed;
+        try {
+          const doc = normalizeDoc(getReq.result); // 事务内读取的当前清单
+          const next = fn(doc) || doc.entries;    // mutator 返回新 entries 或 void
+          committed = normalizeDoc({ ...doc, entries: next });
+          committed.updatedAt = new Date().toISOString();
+          store.put(committed);
+        } catch (err) {
+          try { tx.abort(); } catch { /* 已提交则忽略 */ }
+          reject(err);
+          return;
+        }
+        tx.oncomplete = () => resolve(committed);
+      };
+      getReq.onerror = () => reject(getReq.error);
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error || new Error('写入被中止'));
     });
   }
 
+  // 清空同样在单个读写事务内删除单例文档；解析值为提交后的空清单
   async function clear() {
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
       tx.objectStore(STORE).delete(DOC_ID);
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => resolve(emptyDoc());
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('写入被中止'));
     });
   }
 
-  // 便捷操作：读-改-写整本文档（mutator 返回新 entries 或 void）
-  async function mutate(fn) {
-    const doc = await get();
-    const next = fn(doc) || doc.entries;
-    return save({ ...doc, entries: next });
-  }
-
-  // 追加批注 id 到清单末尾（已存在则保持原位置不重复加入）
+  // 追加批注 id 到清单末尾（已存在则保持原位置不重复加入）。
+  // 判重依据的是事务提交时读到的当前清单，故两个标签页并发加入不同
+  // 批注后两项都保留；并发重复加入同一批注仍只出现一次。
   async function addIds(ids) {
     return mutate((doc) => {
       const have = new Set(doc.entries.map((e) => e.id));
@@ -125,11 +149,14 @@ const CuePlaylist = (() => {
     });
   }
 
+  // 移除一条：同样以事务内读到的当前清单为准（并发排序 + 移除互不丢项）
   async function removeId(id) {
     return mutate((doc) => doc.entries.filter((e) => e.id !== String(id)));
   }
 
-  // 直接写入拖拽后的完整 id 顺序（只允许当前清单内 id 的重排，不偷偷新增）
+  // 直接写入拖拽后的完整 id 顺序。只重排「提交事务时仍在清单中」的 id：
+  // 另一标签页若已移除某条，orderedIds 中的该 id 不会被偷偷加回；另一
+  // 标签页并发新加入、未出现在 orderedIds 中的条目防御性追加到末尾。
   async function reorder(orderedIds) {
     return mutate((doc) => {
       const byId = new Map(doc.entries.map((e) => [e.id, e]));
@@ -139,7 +166,6 @@ const CuePlaylist = (() => {
         const sid = String(id);
         if (byId.has(sid) && !seen.has(sid)) { next.push(byId.get(sid)); seen.add(sid); }
       }
-      // 未出现在 orderedIds 中的条目追加到末尾（防御性，正常拖拽不会触发）
       for (const e of doc.entries) if (!seen.has(e.id)) next.push(e);
       return next;
     });
@@ -316,7 +342,6 @@ const CuePlaylist = (() => {
     makeEntry,
     // IndexedDB
     get,
-    save,
     clear,
     mutate,
     addIds,
