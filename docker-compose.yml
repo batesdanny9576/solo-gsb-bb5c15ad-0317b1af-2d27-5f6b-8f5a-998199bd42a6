@@ -1,0 +1,22 @@
+services:
+  cue-sync:
+    build: .
+    # 单条命令启动：docker compose up --build（构建镜像 + 启动 + 端口映射 + 数据持久化）
+    image: stage-cue-sync:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      # 指挥权租约有效期（秒），默认 15：持有者按心跳续期，断线/超时自动释放
+      - LEASE_TTL_SEC=15
+    volumes:
+      # 挂载事件日志目录，容器重启后本场日志仍可查阅
+      - ./data:/app/data
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/replay/sessions',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
